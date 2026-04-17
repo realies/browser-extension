@@ -21,12 +21,13 @@ import { useEffect, useMemo, useState } from 'react';
 import { useInfiniteQuery, useMutation, useQuery } from '@tanstack/react-query';
 import { getConfig, isConfigured as getIsConfigured } from '../lib/config.ts';
 import { checkLinkExists, postLink } from '../lib/actions/links.ts';
+import { saveAllTabsToLinkwarden } from '../lib/saveAllTabs.ts';
 import { AxiosError } from 'axios';
 import { toast } from '../../hooks/use-toast.ts';
 import { Toaster } from './ui/Toaster.tsx';
 import { getCollections } from '../lib/actions/collections.ts';
 import { getTags } from '../lib/actions/tags.ts';
-import { ExternalLink, X } from 'lucide-react';
+import { ExternalLink, FolderPlus, Layers, X } from 'lucide-react';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/Popover.tsx';
 import { CaretSortIcon } from '@radix-ui/react-icons';
 import {
@@ -39,9 +40,61 @@ import {
 import { Checkbox } from './ui/CheckBox.tsx';
 import { Label } from './ui/Label.tsx';
 
+type CollectionLite = { id: number; name: string; pathname: string };
+
+/**
+ * Renders a "Create new collection: <search>" option at the bottom of the
+ * Command list when the user has typed something that doesn't match any
+ * existing collection. Matching is case-insensitive against both the raw
+ * name and the slash-joined `pathname` so "Inbox" still matches if the
+ * user types "INBOX" or "Parent > Inbox".
+ *
+ * The item's `value` is set to the search text verbatim so cmdk's default
+ * fuzzy filter keeps it visible while the user types.
+ *
+ * `existingNames` is a pre-computed Set built in the parent via `useMemo`
+ * — promotes the duplicate-detection lookup from O(N) per keystroke (when
+ * this helper scanned the collections array inline) to O(1). The caller
+ * is responsible for populating the Set with both `name` and `pathname`
+ * entries, each lower-cased.
+ */
+function renderCreateCollectionItem(params: {
+  existingNames: Set<string>;
+  search: string;
+  onSelect: (name: string) => void;
+}) {
+  const trimmed = params.search.trim();
+  if (!trimmed) return null;
+  const normalised = trimmed.toLowerCase();
+  if (params.existingNames.has(normalised)) return null;
+
+  return (
+    <CommandItem
+      value={trimmed}
+      key={`__create__${normalised}`}
+      className="cursor-pointer flex flex-col items-start justify-start"
+      onSelect={() => params.onSelect(trimmed)}
+    >
+      <p className="flex items-center gap-1.5">
+        <FolderPlus className="h-4 w-4" />
+        <span>
+          Create new collection: <strong>{trimmed}</strong>
+        </span>
+      </p>
+      <p className="text-xs text-neutral-500">
+        It will be created in your Linkwarden instance when you save.
+      </p>
+    </CommandItem>
+  );
+}
+
 const BookmarkForm = () => {
   const [openOptions, setOpenOptions] = useState<boolean>(false);
   const [openCollections, setOpenCollections] = useState<boolean>(false);
+  // Tracked explicitly so we can surface a "Create new collection: X" option
+  // when the user types a name that matches none of their existing
+  // collections (issue #458 feedback).
+  const [collectionSearch, setCollectionSearch] = useState<string>('');
   const [uploadImage, setUploadImage] = useState<boolean>(false);
   const [state, setState] = useState<'capturing' | 'uploading' | null>(null);
 
@@ -77,6 +130,58 @@ const BookmarkForm = () => {
       tags: [],
       description: '',
       image: undefined,
+    },
+  });
+
+  const { mutate: saveAllTabs, isLoading: savingAllTabs } = useMutation({
+    mutationFn: async () => {
+      const current = form.getValues('collection');
+      if (!config?.baseUrl || !config?.apiKey) {
+        throw new Error('Extension is not configured.');
+      }
+      const target =
+        current?.id !== undefined
+          ? {
+              kind: 'collectionId' as const,
+              id: current.id,
+              name: current.name,
+            }
+          : {
+              kind: 'collectionName' as const,
+              name: current?.name || config.defaultCollection || 'Unorganized',
+            };
+
+      return await saveAllTabsToLinkwarden({
+        baseUrl: config.baseUrl,
+        apiKey: config.apiKey,
+        target,
+      });
+    },
+    onError: (error) => {
+      console.error(error);
+      toast({
+        title: 'Error',
+        description:
+          error instanceof Error
+            ? error.message
+            : 'Could not save tabs. Please try again.',
+        variant: 'destructive',
+      });
+    },
+    onSuccess: (result) => {
+      const targetName = form.getValues('collection')?.name || 'Unorganized';
+      const parts: string[] = [];
+      if (result.saved > 0)
+        parts.push(`${result.saved} saved to "${targetName}"`);
+      if (result.skipped > 0) parts.push(`${result.skipped} skipped`);
+      if (result.failed > 0) parts.push(`${result.failed} failed`);
+      toast({
+        title: result.failed > 0 ? 'Partial success' : 'Success',
+        description:
+          parts.join(' · ') ||
+          'No eligible tabs were found to save in this window.',
+        variant: result.failed > 0 ? 'destructive' : 'default',
+      });
     },
   });
 
@@ -151,7 +256,13 @@ const BookmarkForm = () => {
     };
 
     setTabInformation();
-  }, []);
+    // `form` is the stable object returned by react-hook-form's `useForm` —
+    // its identity is stable across renders, so including it here is a safe
+    // no-op that silences the exhaustive-deps warning raised by the
+    // `form.setValue(...)` calls inside `setTabInformation`. Pre-existing
+    // warning in `upstream/dev` at the old line 154; this fix makes lint
+    // green for the Phase B follow-up.
+  }, [form]);
 
   const { handleSubmit, control } = form;
 
@@ -225,6 +336,22 @@ const BookmarkForm = () => {
     );
   }, [tagsData]);
 
+  // Pre-compute a lowercase Set of both bare names and slash-joined
+  // `pathname`s so the "Create new collection: X" suggestion can skip
+  // the O(N) array scan on every keystroke. cmdk's own filter already
+  // re-runs on every character; doing the exact-match check at render
+  // time was visibly sluggish when the user had hundreds of
+  // collections. Rebuilds only when the collection list itself changes.
+  const existingCollectionNames = useMemo(() => {
+    const set = new Set<string>();
+    if (!Array.isArray(collections)) return set;
+    for (const c of collections as CollectionLite[]) {
+      if (c.name) set.add(c.name.toLowerCase());
+      if (c.pathname) set.add(c.pathname.toLowerCase());
+    }
+    return set;
+  }, [collections]);
+
   return (
     <div>
       <Form {...form}>
@@ -261,11 +388,11 @@ const BookmarkForm = () => {
                           {loadingCollections
                             ? 'Unorganized'
                             : field.value?.name
-                            ? collections?.find(
-                                (collection: { name: string }) =>
-                                  collection.name === field.value?.name
-                              )?.name || form.getValues('collection')?.name
-                            : 'Select a collection...'}
+                              ? collections?.find(
+                                  (collection: { name: string }) =>
+                                    collection.name === field.value?.name
+                                )?.name || form.getValues('collection')?.name
+                              : 'Select a collection...'}
                           <CaretSortIcon className="ml-2 h-4 w-4 shrink-0 opacity-50" />
                         </Button>
                       </FormControl>
@@ -288,7 +415,9 @@ const BookmarkForm = () => {
                         <Command className="flex-grow min-w-full dropdown-content rounded-none">
                           <CommandInput
                             className="min-w-[280px]"
-                            placeholder="Search Collection..."
+                            placeholder="Search collection or type a new name…"
+                            value={collectionSearch}
+                            onValueChange={setCollectionSearch}
                           />
 
                           {loadingCollections ? (
@@ -332,6 +461,7 @@ const BookmarkForm = () => {
                                               name: collection.name,
                                             });
                                             setOpenCollections(false);
+                                            setCollectionSearch('');
                                           }}
                                         >
                                           <p>{collection.name}</p>
@@ -342,6 +472,15 @@ const BookmarkForm = () => {
                                       )
                                     )
                                   )}
+                                  {renderCreateCollectionItem({
+                                    existingNames: existingCollectionNames,
+                                    search: collectionSearch,
+                                    onSelect: (name) => {
+                                      form.setValue('collection', { name });
+                                      setOpenCollections(false);
+                                      setCollectionSearch('');
+                                    },
+                                  })}
                                 </CommandGroup>
                               )}
                             </>
@@ -355,7 +494,9 @@ const BookmarkForm = () => {
                         <Command className="flex-grow min-w-full dropdown-content">
                           <CommandInput
                             className="min-w-[280px]"
-                            placeholder="Search collection..."
+                            placeholder="Search collection or type a new name…"
+                            value={collectionSearch}
+                            onValueChange={setCollectionSearch}
                           />
                           <CommandEmpty>No Collection found.</CommandEmpty>
                           {Array.isArray(collections) && (
@@ -392,6 +533,7 @@ const BookmarkForm = () => {
                                           name: collection.name,
                                         });
                                         setOpenCollections(false);
+                                        setCollectionSearch('');
                                       }}
                                     >
                                       <p>{collection.name}</p>
@@ -402,6 +544,15 @@ const BookmarkForm = () => {
                                   )
                                 )
                               )}
+                              {renderCreateCollectionItem({
+                                existingNames: existingCollectionNames,
+                                search: collectionSearch,
+                                onSelect: (name) => {
+                                  form.setValue('collection', { name });
+                                  setOpenCollections(false);
+                                  setCollectionSearch('');
+                                },
+                              })}
                             </CommandGroup>
                           )}
                         </Command>
@@ -509,7 +660,7 @@ const BookmarkForm = () => {
             </>
           )}
 
-          <div className="flex justify-between items-center">
+          <div className="flex justify-between items-center gap-2">
             <Button
               variant="ghost"
               type="button"
@@ -518,9 +669,22 @@ const BookmarkForm = () => {
               {openOptions ? 'Hide' : 'More'} Options
             </Button>
 
-            <Button disabled={isLoading} type="submit">
-              Save
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                type="button"
+                title="Save every open tab in this window to the selected collection"
+                disabled={savingAllTabs || !isConfigured}
+                onClick={() => saveAllTabs()}
+              >
+                <Layers className="h-4 w-4 mr-1" />
+                {savingAllTabs ? 'Saving tabs…' : 'Save all tabs'}
+              </Button>
+
+              <Button disabled={isLoading} type="submit">
+                Save
+              </Button>
+            </div>
           </div>
 
           {isDuplicate && (

@@ -60,3 +60,24 @@ export async function getCollections(baseUrl: string, apiKey: string) {
     },
   };
 }
+
+export async function postCollection(
+  baseUrl: string,
+  apiKey: string,
+  data: { name: string; parentId?: number }
+): Promise<ResponseCollections> {
+  const url = `${baseUrl}/api/v1/collections`;
+
+  const response = await axios.post<{ response: ResponseCollections }>(
+    url,
+    data,
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+
+  return response.data.response;
+}
